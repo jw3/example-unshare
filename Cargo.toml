@@ -3,9 +3,12 @@ name = "example-unshare-ipc"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "umq"
+path = "src/main.rs"
+
 [dependencies]
 posix_mq = "3771.0.0"
 clap = { version = "4.5.26", features = ["derive"] }
 nix = { version = "0.29.0", features = ["sched", "process"] }
 anyhow = "1"
-bollard = "0.18"

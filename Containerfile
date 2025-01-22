@@ -1,3 +1,8 @@
-FROM docker.io/rust:1.84-bullseye
+FROM docker.io/rust:1.84-bullseye as build
 
-RUN cargo install mq_cli
+WORKDIR /src
+COPY . .
+RUN cargo build --release
+
+FROM ubuntu:22.04
+COPY --from=build /src/target/release/umq /usr/local/bin

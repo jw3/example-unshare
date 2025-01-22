@@ -24,17 +24,23 @@ struct Opts {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Remove one or more message queues
     Rm {
         queue_names: Vec<String>,
     },
+    /// List all message queues from the current namespace
     Ls,
+    /// Make a new message queue, with options
     Mk {
+        #[clap(short, long)]
+        verbose: bool,
         #[clap(short, long)]
         unshare: bool,
         #[clap(short, long)]
         daemon: bool,
         queue_name: String,
     },
+    /// Receive messages from message queue, with options
     Rx {
         #[clap(short, long)]
         oneshot: bool,
@@ -42,6 +48,7 @@ enum Cmd {
         enter: Option<i32>,
         queue_name: String,
     },
+    /// Send message to a message queue, with options
     Tx {
         /// pid of the namespace process
         #[clap(short, long)]
@@ -57,7 +64,7 @@ fn main() -> Result<()> {
     let done = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let done = done.clone();
-        move || done.store(true, std::sync::atomic::Ordering::Relaxed)
+        move || done.store(true, Ordering::Relaxed)
     })?;
 
     match opts.command {
@@ -72,12 +79,13 @@ fn main() -> Result<()> {
         Cmd::Rm { queue_names } => {
             for name in queue_names {
                 let qname = Name::new(&name)?;
-                let q = Queue::open(qname).expect("open");
+                let q = Queue::open(qname)?;
                 q.delete()?;
-                println!("deleted {name}");
+                println!("Deleted MQ {name}");
             }
         }
         Cmd::Mk {
+            verbose,
             queue_name,
             daemon,
             unshare,
@@ -89,9 +97,11 @@ fn main() -> Result<()> {
                 println!("unshare {pid}, lsns: {:?}", find_namespace(pid)?);
             }
             let name = Name::new(&queue_name)?;
-            let q = Queue::create(name, 1, 128).expect("create");
-            println!("queue {queue_name} created");
-            println!(" {}", make_podman_cmd(pid, &queue_name, &opts.image_name));
+            let q = Queue::create(name, 1, 128)?;
+            println!("queue {queue_name} created, ipc @ /proc/{pid}/ns/ipc");
+            if verbose {
+                println!(" {}", make_podman_cmd(pid, &queue_name, &opts.image_name));
+            }
             println!("waiting on messages..");
             rx_messages(q, done, !daemon)?;
             println!("done");
@@ -128,7 +138,7 @@ fn main() -> Result<()> {
 fn load_namespaces() -> Result<Vec<Namespace>> {
     let x = Command::new("lsns").arg("--json").stdout(Stdio::piped()).spawn()?.wait_with_output()?.stdout;
     let v: Value = serde_json::from_slice(x.as_slice())?;
-    let v = v.get("namespaces").unwrap().clone();
+    let v = v.get("namespaces").expect("{namespaces=[]}").clone();
     Ok(serde_json::from_value::<Vec<Namespace>>(v)?)
 }
 
@@ -163,7 +173,7 @@ fn list_mqs() -> Result<Vec<String>> {
 
 fn make_podman_cmd(pid: Pid, q_name: &str, image_name: &str) -> String {
     format!(
-        r#"sudo podman run --rm -it --ipc=ns:/proc/{pid}/ns/ipc {image_name} bash -c 'mq_cli ls && mq_cli send {q_name} "Hello, from podman"'"#
+        r#"sudo podman run --rm -it --ipc=ns:/proc/{pid}/ns/ipc {image_name} bash -c 'umq ls && umq tx {q_name} "Hello, from podman"'"#
     )
 }
 
@@ -179,7 +189,7 @@ fn rx_messages(mut q: Queue, done: Arc<AtomicBool>,oneshot: bool) -> Result<()> 
                 break 'o1;
             }
         }
-        let r= x.join().expect("rx");
+        let r= x.join().expect("join");
         q = r.1;
 
         let result = r.0?;

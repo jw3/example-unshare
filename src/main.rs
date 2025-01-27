@@ -1,22 +1,22 @@
-use std::fs::{read_dir, File};
-use std::io::{ Read};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use nix::sched::{setns, CloneFlags};
 use nix::unistd::Pid;
 use posix_mq::{Message, Name, Queue};
+use serde::Deserialize;
+use serde_json::Value;
+use std::fs::{read_dir, File};
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Parser)]
 struct Opts {
-    #[clap(long, default_value = "example")]
+    #[clap(long, default_value = "umq")]
     image_name: String,
     #[clap(subcommand)]
     command: Cmd,
@@ -37,13 +37,14 @@ enum Cmd {
         #[clap(short, long)]
         unshare: bool,
         #[clap(short, long)]
-        daemon: bool,
+        number: Option<usize>,
         queue_name: String,
     },
     /// Receive messages from message queue, with options
     Rx {
+        /// number of messages to receive, then close
         #[clap(short, long)]
-        oneshot: bool,
+        number: Option<usize>,
         #[clap(short, long)]
         enter: Option<i32>,
         queue_name: String,
@@ -87,7 +88,7 @@ fn main() -> Result<()> {
         Cmd::Mk {
             verbose,
             queue_name,
-            daemon,
+            number,
             unshare,
         } => {
             let pid: Pid = nix::unistd::getpid();
@@ -100,27 +101,27 @@ fn main() -> Result<()> {
             let q = Queue::create(name, 1, 128)?;
             println!("queue {queue_name} created, ipc @ /proc/{pid}/ns/ipc");
             if verbose {
-                println!(" {}", make_podman_cmd(pid, &queue_name, &opts.image_name));
+                println!("{}", make_podman_cmd(pid, &queue_name, &opts.image_name));
             }
             println!("waiting on messages..");
-            rx_messages(q, done, !daemon)?;
+            rx_messages(q, done, number)?;
             println!("done");
         }
-        Cmd::Rx { queue_name, oneshot, enter } => {
+        Cmd::Rx { queue_name, number, enter } => {
             if let Some(pid) = enter {
                 let ipc_ns = File::open(format!("/proc/{}/ns/ipc", pid))?;
-                setns(ipc_ns , CloneFlags::CLONE_NEWIPC)?;
+                setns(ipc_ns, CloneFlags::CLONE_NEWIPC)?;
             }
             let name = Name::new(&queue_name)?;
             let q = Queue::open(name)?;
             println!("waiting on messages..");
-            rx_messages(q, done, oneshot)?;
+            rx_messages(q, done, number)?;
             println!("done");
         }
         Cmd::Tx { queue_name, namespace, message } => {
             if let Some(pid) = namespace {
                 let ipc_ns = File::open(format!("/proc/{}/ns/ipc", pid))?;
-                setns(ipc_ns , CloneFlags::CLONE_NEWIPC)?;
+                setns(ipc_ns, CloneFlags::CLONE_NEWIPC)?;
             }
             let name = Name::new(&queue_name)?;
             let q = Queue::open(name)?;
@@ -128,7 +129,7 @@ fn main() -> Result<()> {
                 data: message.into_bytes(),
                 priority: 0,
             })
-            .expect("send");
+                .expect("send");
         }
     }
 
@@ -171,13 +172,16 @@ fn list_mqs() -> Result<Vec<String>> {
     Ok(queues)
 }
 
+// a helper to make a podman run cmd that maps the active namespace
 fn make_podman_cmd(pid: Pid, q_name: &str, image_name: &str) -> String {
-    format!(
-        r#"sudo podman run --rm -it --ipc=ns:/proc/{pid}/ns/ipc {image_name} bash -c 'umq ls && umq tx {q_name} "Hello, from podman"'"#
-    )
+    [
+        format!("sudo podman run --rm -it --ipc=ns:/proc/{pid}/ns/ipc {image_name} ls"),
+        format!("sudo podman run --rm -it --ipc=ns:/proc/{pid}/ns/ipc {image_name} tx {q_name} 'Hello, from podman'")
+    ].map(|s| format!("\t{s}")).join("\n")
 }
 
-fn rx_messages(mut q: Queue, done: Arc<AtomicBool>,oneshot: bool) -> Result<()> {
+fn rx_messages(mut q: Queue, done: Arc<AtomicBool>, number: Option<usize>) -> Result<()> {
+    let mut cnt = 0;
     'o1: loop {
         let x = thread::spawn(move || {
             let m = q.receive();
@@ -189,12 +193,14 @@ fn rx_messages(mut q: Queue, done: Arc<AtomicBool>,oneshot: bool) -> Result<()> 
                 break 'o1;
             }
         }
-        let r= x.join().expect("join");
+        let r = x.join().expect("join");
         q = r.1;
 
         let result = r.0?;
         println!("{:?}", String::from_utf8(result.data)?);
-        if oneshot {
+
+        cnt += 1;
+        if number.map(|n| !(cnt < n)).unwrap_or(false) {
             break;
         }
     }

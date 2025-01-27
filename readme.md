@@ -1,9 +1,9 @@
-example unsharing ipc namespaces
+Linux Namespace Examples
 ===
 
-Demonstrates the `unshare`ing of a processes into a new ipc namespace
+Demonstrates the `unshare`ing isolation and access of namespaces using Podman and syscalls.
 
-Use podman to access the ipc namespace while demonstrating the namespace isolation.
+https://github.com/jw3/example-unshare
 
 ### tools 
 

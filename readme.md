@@ -3,8 +3,6 @@ Linux Namespace Examples
 
 Demonstrates the `unshare`ing isolation and access of namespaces using Podman and syscalls.
 
-https://github.com/jw3/example-unshare
-
 ### tools 
 
 1. umq - helper to list / and send to the mq
@@ -72,6 +70,10 @@ On Ubuntu 24.04 some commands require App Armor config
 9. 
 
 ## Examples
+
+We simulate both containerized execution and unshared execution.
+
+The following examples show how these commands interact. 
 
 ### Create queue /fizz in host namespace
 ```

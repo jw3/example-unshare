@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use nix::sched::{setns, CloneFlags};
 use nix::unistd::Pid;
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use caps::{CapSet, Capability};
 
 #[derive(Parser)]
 struct Opts {
@@ -60,6 +61,22 @@ enum Cmd {
         queue_name: String,
         message: String,
     },
+    /// Move messages from one queue to another
+    /// Queues may be in different namespaces
+    Bridge {
+        /// pid of the namespace process
+        #[clap(short('o'), long)]
+        target_namespace: Option<i32>,
+        /// pid of the namespace process
+        #[clap(short('i'), long)]
+        source_namespace: Option<i32>,
+        #[clap(short, long)]
+        source_queue_name: String,
+        #[clap(short, long)]
+        target_queue_name: String,
+        #[clap(short, long)]
+        number: Option<usize>,
+    }
 }
 
 fn main() -> Result<()> {
@@ -115,7 +132,10 @@ fn main() -> Result<()> {
                 println!("{}", make_podman_cmd(pid, &queue_name, &opts.image_name));
             }
             println!("waiting on messages..");
-            rx_messages(q, done, number)?;
+            rx_messages(q, done, number, |s| {
+                println!("{}", s);
+                Ok(())
+            })?;
             println!("done");
         }
         Cmd::Rx { queue_name, number, enter } => {
@@ -126,7 +146,10 @@ fn main() -> Result<()> {
             let name = Name::new(&queue_name)?;
             let q = Queue::open(name)?;
             println!("waiting on messages..");
-            rx_messages(q, done, number)?;
+            rx_messages(q, done, number, |s| {
+                println!("{}", s);
+                Ok(())
+            })?;
             println!("done");
         }
         Cmd::Tx { queue_name, namespace, message } => {
@@ -141,6 +164,55 @@ fn main() -> Result<()> {
                 priority: 0,
             })
                 .expect("send");
+        }
+        Cmd::Bridge { target_namespace, source_namespace, source_queue_name, target_queue_name, number } => {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            // rx thread
+            thread::spawn(move || {
+                if let Some(pid) = source_namespace {
+                    let ipc_ns = File::open(format!("/proc/{}/ns/ipc", pid)).expect("rx-open-ns");
+                    setns(ipc_ns, CloneFlags::CLONE_NEWIPC).expect("rx-thread-setns");
+                    println!("joined source namespace");
+
+                    for c in [CapSet::Effective, CapSet::Permitted] {
+                        caps::drop(None, c, Capability::CAP_SYS_ADMIN).unwrap();
+                        println!("rx dropped {:?} in {c:?}", Capability::CAP_SYS_ADMIN);
+                    }
+                }
+
+                let name = Name::new(&source_queue_name).expect("rx-name");
+                let source = Queue::open(name).expect("rx-open-ns");
+                rx_messages(source, done, number, |s| {
+                    tx.send(s.clone()).with_context(|| "bridge-rx")
+                }).expect("bridge-rx");
+            });
+
+            // tx thread
+            thread::spawn(move || {
+                if let Some(pid) = target_namespace {
+                    let ipc_ns = File::open(format!("/proc/{}/ns/ipc", pid)).expect("tx-open-ns");
+                    setns(ipc_ns, CloneFlags::CLONE_NEWIPC).expect("tx-thread-setns");
+                    println!("joined target namespace");
+
+                    for c in [CapSet::Effective, CapSet::Permitted] {
+                        caps::drop(None, c, Capability::CAP_SYS_ADMIN).unwrap();
+                        println!("tx dropped {:?} in {c:?}", Capability::CAP_SYS_ADMIN);
+                    }
+                }
+
+                let name = Name::new(&target_queue_name).expect("tx-name");
+                let target = Queue::open(name).expect("tx-open-ns");
+                while let Ok(msg) = rx.recv() {
+                    println!("{}", msg);
+                    let msg = format!("[bridged] {:?}", msg);
+                    if let Err(e) = target.send(&Message {
+                        data: msg.into_bytes(),
+                        priority: 0,
+                    }) {
+                        println!("bridge-tx {e:?}");
+                    }
+                }
+            }).join().expect("bridge-join");
         }
     }
 
@@ -191,7 +263,9 @@ fn make_podman_cmd(pid: Pid, q_name: &str, image_name: &str) -> String {
     ].map(|s| format!("\t{s}")).join("\n")
 }
 
-fn rx_messages(mut q: Queue, done: Arc<AtomicBool>, number: Option<usize>) -> Result<()> {
+fn rx_messages<F>(mut q: Queue, done: Arc<AtomicBool>, number: Option<usize>, f: F) -> Result<()> where
+    F: Fn(String) -> Result<()>
+{
     let mut cnt = 0;
     'o1: loop {
         let x = thread::spawn(move || {
@@ -208,7 +282,9 @@ fn rx_messages(mut q: Queue, done: Arc<AtomicBool>, number: Option<usize>) -> Re
         q = r.1;
 
         let result = r.0?;
-        println!("{:?}", String::from_utf8(result.data)?);
+        if let Err(e) = f(String::from_utf8(result.data)?) {
+            println!("err in rx fn: {e:?}")
+        }
 
         cnt += 1;
         if number.map(|n| !(cnt < n)).unwrap_or(false) {

@@ -29,7 +29,10 @@ enum Cmd {
         queue_names: Vec<String>,
     },
     /// List all message queues from the current namespace
-    Ls,
+    Ls {
+        #[clap(short, long)]
+        namespace: Option<i32>,
+    },
     /// Make a new message queue, with options
     Mk {
         #[clap(short, long)]
@@ -69,7 +72,15 @@ fn main() -> Result<()> {
     })?;
 
     match opts.command {
-        Cmd::Ls => {
+        Cmd::Ls { namespace } => {
+            if let Some(pid) = namespace {
+                let mnt_ns = File::open(format!("/proc/{}/ns/mnt", pid))?;
+                setns(mnt_ns, CloneFlags::CLONE_NEWNS)?;
+
+                let ipc_ns = File::open(format!("/proc/{}/ns/ipc", pid))?;
+                setns(ipc_ns, CloneFlags::CLONE_NEWIPC)?;
+            }
+
             let mqs = list_mqs()?;
             if mqs.is_empty() {
                 println!("No MQs found");

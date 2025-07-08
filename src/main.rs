@@ -14,6 +14,7 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use caps::{CapSet, Capability};
+use tokio::net::UdpSocket;
 
 #[derive(Parser)]
 struct Opts {
@@ -76,10 +77,21 @@ enum Cmd {
         target_queue_name: String,
         #[clap(short, long)]
         number: Option<usize>,
+    },
+    Net {
+        #[clap(short('H'), long)]
+        address: String,
+        #[clap(short, long, default_value = "8080")]
+        port: u16,
+        #[clap(short, long)]
+        target_queue_name: String,
+        #[clap(short, long)]
+        number: Option<usize>,
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opts: Opts = Opts::parse();
 
     let done = Arc::new(AtomicBool::new(false));
@@ -213,6 +225,21 @@ fn main() -> Result<()> {
                     }
                 }
             }).join().expect("bridge-join");
+        },
+        Cmd::Net { address, port, target_queue_name, .. } => {
+            let socket = UdpSocket::bind(format!("{address}:{port}")).await?;
+            println!("listening on {address}:{port}");
+
+            let name = Name::new(&target_queue_name).expect("tx-name");
+            let target = Queue::open(name).expect("tx-open");
+
+            let mut buf = [0; 1024];
+            while let Ok((len, _)) = socket.recv_from(&mut buf).await {
+                target.send(&Message {
+                    data: buf[..len].to_vec(),
+                    priority: 0,
+                }).context("net-tx")?;
+            }
         }
     }
 
